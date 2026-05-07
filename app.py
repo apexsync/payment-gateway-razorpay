@@ -21,7 +21,8 @@ app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 # Allow CORS
 allowed_origins_env = os.getenv('ALLOWED_ORIGINS')
 if allowed_origins_env:
-    allowed_origins = allowed_origins_env.split(',')
+    # Split by comma and strip any whitespace from each origin
+    allowed_origins = [origin.strip() for origin in allowed_origins_env.split(',')]
 else:
     # Default to allowing local development if no origins specified
     allowed_origins = ["http://localhost:5173", "http://localhost:3000"]

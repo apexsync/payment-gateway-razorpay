@@ -410,6 +410,47 @@ def cancel_consignment():
         app.logger.error(f"Cancellation Error: {str(e)}")
         return jsonify({"error": "Internal error during cancellation"}), 500
 
+@app.route('/refund-payment', methods=['POST'])
+@limiter.limit("10 per minute")
+def refund_payment():
+    """
+    Issues a refund for a payment via Razorpay.
+    """
+    try:
+        data = request.get_json()
+        payment_id = data.get('paymentId')
+        amount = data.get('amount') # Optional: Amount in rupees. If not provided, full refund is issued.
+        
+        if not payment_id:
+            return jsonify({"error": "Payment ID is required"}), 400
+
+        # Construct refund data
+        refund_data = {
+            "payment_id": payment_id
+        }
+        
+        # If amount is provided, convert to paise for Razorpay
+        if amount:
+            refund_data["amount"] = int(float(amount) * 100)
+
+        # Issue Refund via Razorpay Client
+        refund = client.payment.refund(payment_id, refund_data)
+        
+        return jsonify({
+            "status": "success",
+            "message": "Refund issued successfully",
+            "refund_id": refund.get('id'),
+            "details": refund
+        }), 200
+
+    except Exception as e:
+        app.logger.error(f"Refund Error: {str(e)}")
+        # Check for specific Razorpay errors
+        error_msg = str(e)
+        if "already been refunded" in error_msg:
+            return jsonify({"error": "This payment has already been refunded"}), 400
+        return jsonify({"error": f"Failed to issue refund: {error_msg}"}), 500
+
 if __name__ == '__main__':
     # For local development only. Production servers use Gunicorn/Vercel.
     is_dev = os.getenv('FLASK_ENV') == 'development'

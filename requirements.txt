@@ -6,4 +6,5 @@ flask-limiter
 gunicorn
 requests
 redis
+firebase-admin
 

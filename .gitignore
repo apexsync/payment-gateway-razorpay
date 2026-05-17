@@ -140,3 +140,7 @@ lerna-debug.log*
 .idea/
 *.swp
 *.swo
+
+# Firebase Service Account Credentials
+firebase-service-account.json
+

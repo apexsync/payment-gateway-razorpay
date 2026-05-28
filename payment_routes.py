@@ -1,6 +1,8 @@
 import hmac
 import hashlib
 import razorpay
+import re
+from datetime import datetime, timezone
 from flask import Blueprint, request, jsonify
 from firebase_admin import firestore
 from config import db, client, limiter, RAZORPAY_KEY_SECRET, app
@@ -20,18 +22,94 @@ def create_order():
 
     try:
         data = request.get_json()
-        amount = data.get('amount') # In rupees
         currency = data.get('currency', 'INR')
+        address = data.get('address')
+        items = data.get('items', [])
+        user_id = data.get('userId')
 
-        if not amount:
-            return jsonify({"error": "Amount is required"}), 400
+        # 1. Enforce Kerala delivery only
+        if not address or not address.get('state') or address.get('state').strip().lower() != 'kerala':
+            return jsonify({"error": "We currently only deliver to Kerala."}), 400
 
-        # Validate amount >= 100 paise (1 INR)
-        try:
-            amount_paise = int(float(amount) * 100)
-        except ValueError:
-            return jsonify({"error": "Invalid amount format"}), 400
+        if not user_id or not items:
+            return jsonify({"error": "User ID and items are required"}), 400
 
+        # 2. Securely calculate Subtotal from products in Firestore
+        subtotal = 0.0
+        for item in items:
+            product_id = item.get('id')
+            quantity = int(item.get('quantity', 1))
+            if not product_id:
+                continue
+            p_doc = db.collection('products').document(product_id).get()
+            if not p_doc.exists:
+                return jsonify({"error": f"Product with ID {product_id} not found"}), 400
+            p_data = p_doc.to_dict()
+            
+            price_raw = p_data.get('price', 0)
+            if isinstance(price_raw, str):
+                price_clean = re.sub(r'[^0-9.]', '', price_raw)
+                price = float(price_clean) if price_clean else 0.0
+            else:
+                price = float(price_raw)
+            
+            subtotal += price * quantity
+
+        # 3. Process and validate coupon
+        discount = 0.0
+        coupon_code = data.get('couponCode')
+        if coupon_code:
+            coupon_code = coupon_code.strip().upper()
+            coupon_doc = db.collection('coupons').document(coupon_code).get()
+            if coupon_doc.exists:
+                c_data = coupon_doc.to_dict()
+                if c_data.get('isActive', False):
+                    # Check expiration
+                    expires_at = c_data.get('expiresAt')
+                    is_expired = False
+                    if expires_at:
+                        now = datetime.now(timezone.utc)
+                        if expires_at.tzinfo is None:
+                            now_naive = datetime.now()
+                            if expires_at < now_naive:
+                                is_expired = True
+                        else:
+                            if expires_at < now:
+                                is_expired = True
+                                
+                    # Check usage limit
+                    max_uses = c_data.get('maxUses')
+                    used_count = c_data.get('usedCount', 0)
+                    is_limit_reached = max_uses is not None and used_count >= max_uses
+                    
+                    # Check min purchase
+                    min_purchase = float(c_data.get('minPurchase', 0))
+                    
+                    if not is_expired and not is_limit_reached and subtotal >= min_purchase:
+                        if c_data.get('discountType') == 'percentage':
+                            discount = subtotal * (float(c_data.get('discountValue', 0)) / 100.0)
+                        elif c_data.get('discountType') == 'fixed':
+                            discount = float(c_data.get('discountValue', 0))
+                        discount = min(discount, subtotal)
+                    else:
+                        if is_expired:
+                            return jsonify({"error": "Coupon has expired"}), 400
+                        elif is_limit_reached:
+                            return jsonify({"error": "Coupon usage limit reached"}), 400
+                        elif subtotal < min_purchase:
+                            return jsonify({"error": f"Minimum purchase of ₹{min_purchase} required"}), 400
+                else:
+                    return jsonify({"error": "Coupon is inactive"}), 400
+            else:
+                return jsonify({"error": "Invalid coupon code"}), 400
+
+        # 4. Calculate Final Total
+        delivery_charge = 50.0
+        platform_fee = 20.0
+        calculated_total = subtotal + delivery_charge + platform_fee - discount
+        calculated_total = max(0.0, calculated_total)
+
+        amount_paise = int(round(calculated_total * 100))
         if amount_paise < 100:
             return jsonify({"error": "Minimum amount must be 100 paise (1 INR)"}), 400
 
@@ -54,25 +132,28 @@ def create_order():
                 return jsonify({"error": "Razorpay authentication failed"}), 401
             raise e
         
-        # Optional: Pre-create a 'Pending' order record in Firestore
-        # This helps track abandoned checkouts and simplifies the verification flow
-        if db and data.get('userId') and data.get('items'):
-            try:
-                orders_ref = db.collection('orders')
-                order_payload = {
-                    'userId': data.get('userId'),
-                    'items': data.get('items'),
-                    'total': amount,
-                    'address': data.get('address'),
-                    'razorpayOrderId': order['id'],
-                    'status': 'Pending',
-                    'createdAt': firestore.SERVER_TIMESTAMP,
-                    'updatedAt': firestore.SERVER_TIMESTAMP
-                }
-                orders_ref.document().set(order_payload)
-            except Exception as fe:
-                print(f"Failed to pre-save pending order: {str(fe)}")
-                app.logger.warning(f"Failed to pre-save pending order: {str(fe)}")
+        # Pre-create a 'Pending' order record in Firestore
+        try:
+            orders_ref = db.collection('orders')
+            order_payload = {
+                'userId': user_id,
+                'items': items,
+                'subtotal': subtotal,
+                'deliveryCharge': delivery_charge,
+                'platformFee': platform_fee,
+                'discount': discount,
+                'couponCode': coupon_code if coupon_code else None,
+                'total': calculated_total,
+                'address': address,
+                'razorpayOrderId': order['id'],
+                'status': 'Pending',
+                'createdAt': firestore.SERVER_TIMESTAMP,
+                'updatedAt': firestore.SERVER_TIMESTAMP
+            }
+            orders_ref.document().set(order_payload)
+        except Exception as fe:
+            print(f"Failed to pre-save pending order: {str(fe)}")
+            app.logger.warning(f"Failed to pre-save pending order: {str(fe)}")
 
         return jsonify(order), 200
 
@@ -161,6 +242,19 @@ def verify_payment():
                         'paymentId': razorpay_payment_id,
                         'updatedAt': firestore.SERVER_TIMESTAMP
                     })
+
+                    # Increment coupon uses atomically if a coupon was used
+                    coupon_code = order_data.get('couponCode')
+                    if coupon_code:
+                        coupon_ref = db.collection('coupons').document(coupon_code)
+                        coupon_snap = coupon_ref.get(transaction=transaction)
+                        if coupon_snap.exists:
+                            current_uses = coupon_snap.get('usedCount') or 0
+                            transaction.update(coupon_ref, {
+                                'usedCount': current_uses + 1,
+                                'updatedAt': firestore.SERVER_TIMESTAMP
+                            })
+
                     return {"status": "success", "order_data": order_data, "order_id": order_doc.id}
 
                 res = finalize_order(db.transaction(), db.collection('orders'), db.collection('products'))

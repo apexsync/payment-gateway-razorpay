@@ -105,7 +105,7 @@ def create_order():
 
         # 4. Calculate Final Total
         delivery_charge = 50.0
-        platform_fee = 20.0
+        platform_fee = 0.0
         calculated_total = subtotal + delivery_charge + platform_fee - discount
         calculated_total = max(0.0, calculated_total)
 

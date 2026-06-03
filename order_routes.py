@@ -119,41 +119,52 @@ def place_order():
         # Define transaction logic
         @firestore.transactional
         def create_order_transaction(transaction, orders_ref, products_ref):
-            # 1. Verify and Update Stock
+            # --- PHASE 1: ALL READS ---
+            product_snaps = {}
             for item in items:
                 product_id = item.get('id')
-                qty = item.get('quantity', 1)
-                
                 if not product_id:
                     continue
-                    
                 product_doc_ref = products_ref.document(product_id)
-                snapshot = product_doc_ref.get(transaction=transaction)
+                product_snaps[product_id] = {
+                    'ref': product_doc_ref,
+                    'snap': product_doc_ref.get(transaction=transaction),
+                    'qty': item.get('quantity', 1)
+                }
                 
-                if not snapshot.exists:
-                    raise Exception(f"Product {product_id} not found")
-                
-                current_stock = snapshot.get('stock') or 0
-                if current_stock < qty:
-                    raise Exception(f"Insufficient stock for {snapshot.get('name') or product_id}")
-                
-                # Update stock
-                transaction.update(product_doc_ref, {
-                    'stock': current_stock - qty
-                })
-
-            # 2. Increment coupon uses atomically if a coupon was used
+            coupon_snap = None
+            coupon_ref = None
             if coupon_code:
                 coupon_ref = db.collection('coupons').document(coupon_code)
                 coupon_snap = coupon_ref.get(transaction=transaction)
-                if coupon_snap.exists:
-                    current_uses = coupon_snap.get('usedCount') or 0
-                    transaction.update(coupon_ref, {
-                        'usedCount': current_uses + 1,
-                        'updatedAt': firestore.SERVER_TIMESTAMP
-                    })
 
-            # 3. Create Order Document
+            # --- PHASE 2: VALIDATION ---
+            for product_id, data in product_snaps.items():
+                snap = data['snap']
+                if not snap.exists:
+                    raise Exception(f"Product {product_id} not found")
+                
+                current_stock = snap.get('stock') or 0
+                if current_stock < data['qty']:
+                    raise Exception(f"Insufficient stock for {snap.get('name') or product_id}")
+
+            # --- PHASE 3: ALL WRITES ---
+            for product_id, data in product_snaps.items():
+                ref = data['ref']
+                snap = data['snap']
+                current_stock = snap.get('stock') or 0
+                transaction.update(ref, {
+                    'stock': current_stock - data['qty']
+                })
+
+            if coupon_code and coupon_snap and coupon_snap.exists:
+                current_uses = coupon_snap.get('usedCount') or 0
+                transaction.update(coupon_ref, {
+                    'usedCount': current_uses + 1,
+                    'updatedAt': firestore.SERVER_TIMESTAMP
+                })
+
+            # Create Order Document
             new_order_ref = orders_ref.document()
             order_payload = {
                 'userId': user_id,
@@ -296,8 +307,19 @@ def update_order_status():
             
             active_statuses = ['Processing', 'Confirmed', 'Packed', 'Ready to Ship', 'Shipped', 'Out for Delivery', 'Delivered']
             
-            # Case A: Confirming a Pending Order -> Reduce Stock
+            # --- PHASE 1: ALL READS ---
+            product_snaps = {}
+            needs_stock_update = False
+            update_type = None
+            
             if old_status == 'Pending' and new_status in active_statuses:
+                needs_stock_update = True
+                update_type = 'reduce'
+            elif old_status in active_statuses and new_status in ['Cancelled', 'Returned']:
+                needs_stock_update = True
+                update_type = 'restore'
+                
+            if needs_stock_update:
                 for item in o_data.get('items', []):
                     product_id = item.get('id')
                     try:
@@ -308,68 +330,56 @@ def update_order_status():
                         continue
                         
                     product_ref = products_ref.document(product_id)
-                    p_snap = product_ref.get(transaction=transaction)
-                    if not p_snap.exists:
-                        raise Exception(f"Product {product_id} not found")
-                    
-                    try:
-                        current_stock = int(p_snap.get('stock') or 0)
-                    except (ValueError, TypeError):
-                        current_stock = 0
-                        
-                    if current_stock < qty:
-                        raise Exception(f"Insufficient stock for {p_snap.get('name') or product_id}")
-                    
-                    transaction.update(product_ref, {
-                        'stock': current_stock - qty
-                    })
-                
-                # Increment coupon uses
+                    product_snaps[product_id] = {
+                        'ref': product_ref,
+                        'snap': product_ref.get(transaction=transaction),
+                        'qty': qty
+                    }
+
+                coupon_snap = None
+                coupon_ref = None
                 coupon_code = o_data.get('couponCode')
                 if coupon_code:
                     coupon_ref = db.collection('coupons').document(coupon_code)
                     coupon_snap = coupon_ref.get(transaction=transaction)
-                    if coupon_snap.exists:
-                        current_uses = coupon_snap.get('usedCount') or 0
-                        transaction.update(coupon_ref, {
-                            'usedCount': current_uses + 1,
-                            'updatedAt': firestore.SERVER_TIMESTAMP
-                        })
 
-            # Case B: Cancelling/Returning a Paid/Confirmed Order -> Restore Stock
-            elif old_status in active_statuses and new_status in ['Cancelled', 'Returned']:
-                for item in o_data.get('items', []):
-                    product_id = item.get('id')
+            # --- PHASE 2: VALIDATION ---
+            if needs_stock_update and update_type == 'reduce':
+                for product_id, data in product_snaps.items():
+                    snap = data['snap']
+                    if not snap.exists:
+                        raise Exception(f"Product {product_id} not found")
                     try:
-                        qty = int(item.get('quantity', 1))
+                        current_stock = int(snap.get('stock') or 0)
                     except (ValueError, TypeError):
-                        qty = 1
-                    if not product_id:
-                        continue
-                        
-                    product_ref = products_ref.document(product_id)
-                    p_snap = product_ref.get(transaction=transaction)
-                    if p_snap.exists:
+                        current_stock = 0
+                    if current_stock < data['qty']:
+                        raise Exception(f"Insufficient stock for {snap.get('name') or product_id}")
+
+            # --- PHASE 3: ALL WRITES ---
+            if needs_stock_update:
+                for product_id, data in product_snaps.items():
+                    snap = data['snap']
+                    ref = data['ref']
+                    if snap.exists:
                         try:
-                            current_stock = int(p_snap.get('stock') or 0)
+                            current_stock = int(snap.get('stock') or 0)
                         except (ValueError, TypeError):
                             current_stock = 0
                         
-                        transaction.update(product_ref, {
-                            'stock': current_stock + qty
-                        })
+                        new_stock = current_stock - data['qty'] if update_type == 'reduce' else current_stock + data['qty']
+                        transaction.update(ref, {'stock': new_stock})
                 
-                # Decrement coupon uses
-                coupon_code = o_data.get('couponCode')
-                if coupon_code:
-                    coupon_ref = db.collection('coupons').document(coupon_code)
-                    coupon_snap = coupon_ref.get(transaction=transaction)
-                    if coupon_snap.exists:
-                        current_uses = coupon_snap.get('usedCount') or 0
-                        transaction.update(coupon_ref, {
-                            'usedCount': max(0, current_uses - 1),
-                            'updatedAt': firestore.SERVER_TIMESTAMP
-                        })
+                if coupon_code and coupon_snap and coupon_snap.exists:
+                    current_uses = coupon_snap.get('usedCount') or 0
+                    if update_type == 'reduce':
+                        new_uses = current_uses + 1
+                    else:
+                        new_uses = max(0, current_uses - 1)
+                    transaction.update(coupon_ref, {
+                        'usedCount': new_uses,
+                        'updatedAt': firestore.SERVER_TIMESTAMP
+                    })
 
             # Update status
             transaction.update(o_ref, {

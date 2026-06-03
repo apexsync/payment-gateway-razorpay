@@ -210,11 +210,20 @@ def verify_payment():
                         # If no pending order found, we might need to create one (fallback)
                         return "Order document not found for verification"
 
-                    order_data = order_doc.to_dict()
+                    # To ensure the order is locked in the transaction, get it transactionally
+                    order_ref = orders_ref.document(order_doc.id)
+                    order_snap = order_ref.get(transaction=transaction)
+                    if not order_snap.exists:
+                        return "Order document missing"
+
+                    order_data = order_snap.to_dict()
                     if order_data.get('status') != 'Pending':
                         return "Order already processed"
 
-                    # Atomic Stock Reduction
+                    # --- 1. PERFORM ALL READS ---
+                    
+                    # Read products
+                    product_updates = []
                     for item in order_data.get('items', []):
                         pid = item.get('id')
                         try:
@@ -234,26 +243,38 @@ def verify_payment():
                             
                         if cur_stock < qty: raise Exception(f"Stock exhausted for {p_snap.get('name')}")
                         
-                        transaction.update(p_ref, {'stock': cur_stock - qty})
+                        product_updates.append((p_ref, cur_stock - qty))
 
-                    # Update Order to 'Processing'
-                    transaction.update(order_doc.reference, {
-                        'status': 'Processing',
-                        'paymentId': razorpay_payment_id,
-                        'updatedAt': firestore.SERVER_TIMESTAMP
-                    })
-
-                    # Increment coupon uses atomically if a coupon was used
+                    # Read coupon
+                    coupon_update = None
                     coupon_code = order_data.get('couponCode')
                     if coupon_code:
                         coupon_ref = db.collection('coupons').document(coupon_code)
                         coupon_snap = coupon_ref.get(transaction=transaction)
                         if coupon_snap.exists:
                             current_uses = coupon_snap.get('usedCount') or 0
-                            transaction.update(coupon_ref, {
-                                'usedCount': current_uses + 1,
-                                'updatedAt': firestore.SERVER_TIMESTAMP
-                            })
+                            coupon_update = (coupon_ref, current_uses + 1)
+
+                    # --- 2. PERFORM ALL WRITES ---
+                    
+                    # Update products
+                    for p_ref, new_stock in product_updates:
+                        transaction.update(p_ref, {'stock': new_stock})
+
+                    # Update order to 'Processing'
+                    transaction.update(order_ref, {
+                        'status': 'Processing',
+                        'paymentId': razorpay_payment_id,
+                        'updatedAt': firestore.SERVER_TIMESTAMP
+                    })
+
+                    # Increment coupon uses
+                    if coupon_update:
+                        c_ref, new_uses = coupon_update
+                        transaction.update(c_ref, {
+                            'usedCount': new_uses,
+                            'updatedAt': firestore.SERVER_TIMESTAMP
+                        })
 
                     return {"status": "success", "order_data": order_data, "order_id": order_doc.id}
 

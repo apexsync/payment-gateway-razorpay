@@ -288,6 +288,9 @@ def update_order_status():
         data = request.get_json()
         order_id = data.get('orderId')
         new_status = data.get('status')
+        tracking_id = data.get('trackingId')
+        awb_number = data.get('awbNumber')
+        courier = data.get('courier')
         
         if not order_id or not new_status:
             return jsonify({"error": "Order ID and status are required"}), 400
@@ -302,7 +305,16 @@ def update_order_status():
             o_data = o_snap.to_dict()
             old_status = o_data.get('status', 'Pending')
             
-            if old_status == new_status:
+            # Keep trackingId and awbNumber in sync
+            t_id = tracking_id if tracking_id is not None else (awb_number if awb_number is not None else None)
+            awb_no = awb_number if awb_number is not None else (tracking_id if tracking_id is not None else None)
+            
+            is_status_changed = old_status != new_status
+            is_tracking_changed = t_id is not None and t_id != o_data.get('trackingId')
+            is_awb_changed = awb_no is not None and awb_no != o_data.get('awbNumber')
+            is_courier_changed = courier is not None and courier != o_data.get('courier')
+            
+            if not is_status_changed and not is_tracking_changed and not is_awb_changed and not is_courier_changed:
                 return "No status change needed"
             
             active_statuses = ['Processing', 'Confirmed', 'Packed', 'Ready to Ship', 'Shipped', 'Out for Delivery', 'Delivered']
@@ -381,11 +393,19 @@ def update_order_status():
                         'updatedAt': firestore.SERVER_TIMESTAMP
                     })
 
-            # Update status
-            transaction.update(o_ref, {
+            # Update status and tracking info
+            update_payload = {
                 'status': new_status,
                 'updatedAt': firestore.SERVER_TIMESTAMP
-            })
+            }
+            if t_id is not None:
+                update_payload['trackingId'] = t_id
+            if awb_no is not None:
+                update_payload['awbNumber'] = awb_no
+            if courier is not None:
+                update_payload['courier'] = courier
+                
+            transaction.update(o_ref, update_payload)
             return "success"
 
         transaction = db.transaction()

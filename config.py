@@ -35,7 +35,10 @@ if firebase_service_account:
 
 if cred:
     try:
-        firebase_admin.initialize_app(cred)
+        if not firebase_admin._apps:
+            firebase_admin.initialize_app(cred)
+        else:
+            firebase_admin.get_app()
         db = firestore.client()
         print("Firebase Admin successfully initialized!")
     except Exception as e:
